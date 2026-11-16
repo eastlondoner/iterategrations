@@ -42,20 +42,11 @@
 // said), the WhatsApp lend's payloads.
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { connectVoiceDevice, type VoiceCall, type VoiceDevice } from "@iterate-com/voice/call";
 import { z } from "zod";
-import {
-  SignupSms,
-  signupConsent,
-  SIGNUP_CONFIRMATION,
-  SIGNUP_DAILY_CAP,
-  SIGNUP_OFFER,
-  SIGNUP_URL,
-  type SignupConsent,
-} from "./signup-sms.ts";
+import { emailIn, WAITING_LIST_CHANGES, type WaitingListOutcome } from "./waiting-list.ts";
 
 export const description =
   "Phone calls on the agents' own number: call({ to, opening, brief, reportTo }) rings the person's phone and connects them to a voice agent that says `opening` and knows `brief`; a call from a known number to the agents' number is answered the same way; hangup(), status(), lines(). Call __describe() first.";
@@ -116,7 +107,7 @@ const SalesRoute = z.object({
   mode: z.literal("sales"),
   profile: z.string(),
   client: z.string().regex(/^phone-sales-[0-9a-f-]{36}$/),
-  instructions: z.string().min(1).includes("https://cloud.iterate.com"),
+  instructions: z.string().min(1),
   opening: z.string().min(1),
   source: z.string().optional(),
 });
@@ -162,7 +153,6 @@ const BUSY_KEY = "calls/busy";
 /** The mind, as `iterate provide` hands it over: the parts this file uses. */
 type Mind = Parameters<typeof connectVoiceDevice>[0] & {
   config: {
-    sendSms(input: { from: string; to: string; text: string }): Promise<unknown>;
     routeCall(input: { line: string; from: string }): Promise<unknown>;
   };
   repos: {
@@ -245,8 +235,8 @@ type ActiveCall = {
     client: string;
     prompt: string;
     commitOid: string;
-    smsConsent: SignupConsent;
-    smsAttempt: { started: boolean };
+    /** The address noted for the mind's waiting list, and how many times this call noted one. */
+    waitingList: { email: string | null; notes: number };
   } | null;
   untrustedCaller: boolean;
   reportTo: string | undefined;
@@ -321,7 +311,8 @@ const isSales = (current: ActiveCall) => current.direction === "in" && current.m
 const clientFor = (current: ActiveCall) =>
   current.sales?.client ?? current.client ?? `phone-${current.number || "test"}`;
 
-/** A sales relay has no general agent. Only the fixed signup SMS action can have an external effect. */
+/** A sales relay has no general agent. Its one action notes an email address on the call, for the
+ *  mind's waiting list; the bridge itself sends nothing. */
 async function salesDevice(mind: Mind, current: ActiveCall): Promise<VoiceDevice<VoiceContext>> {
   const sales = current.sales;
   if (!sales) throw new Error("The sales prompt has not been loaded.");
@@ -388,38 +379,28 @@ async function prepareSales(
     client: route.client,
     prompt: route.instructions,
     commitOid,
-    smsConsent: { state: "not-offered", at: 0 },
-    smsAttempt: { started: false },
+    waitingList: { email: null, notes: 0 },
   };
   current.opening = route.opening;
   current.brief = route.instructions;
 }
 
-/** The fixed signup SMS goes from the sales line the caller rang: one sender per line. */
-const signupSmsByLine = new Map<string, SignupSms>();
-const signupSmsFor = (line: Line): SignupSms => {
-  let sender = signupSmsByLine.get(line.digits);
-  if (!sender) signupSmsByLine.set(line.digits, (sender = newSignupSms(line.number)));
-  return sender;
-};
-const newSignupSms = (from: string) =>
-  new SignupSms({
-    from,
-    ownNumbers: (process.env.PHONE_SIP_NUMBERS || process.env.PHONE_SIP_NUMBER || "")
-      .split(",")
-      .map((number) => `+${number.replace(/\D/g, "")}`),
-    stateFile:
-      process.env.PHONE_CALLS_SIGNUP_SMS_STATE_FILE ||
-      join(homedir(), ".local/state/iterate-mind-phone-calls/signup-sms.json"),
-    now: () => Date.now(),
-    timeoutMs: 20_000,
-    send: async (input) => {
-      if (!itx) throw new Error("Phone bridge is disconnected.");
-      return await itx.config.sendSms(input);
-    },
-  });
+/** What the voice model is told after a delegation, by its outcome. */
+function waitingListGuidance(outcome: WaitingListOutcome, email: string | null, left: number) {
+  switch (outcome.status) {
+    case "noted":
+      return `The address ${String(email)} is noted for the waiting list. One email goes to it after this call ends; nothing was sent yet, so do not say that an email was sent. Read the address back once so the caller can correct it. To correct it, delegate again with the right address (${String(left)} changes left). No other action is permitted.`;
+    case "no-address":
+      return "No address was noted: the message held no valid email address. Ask the caller to spell it, read it back, and delegate again with the address written as name@example.com. No other action is permitted.";
+    case "several-addresses":
+      return "No address was noted: the message held more than one email address. Delegate again with one address only.";
+    case "too-many-changes":
+      return "The address was not changed: this call has no changes left. The address noted before stays.";
+  }
+}
 
-/** Delegation text is data. The only action uses consent facts and the active call's fixed destination. */
+/** Delegation text is data. Its one effect is the email address noted on the active call, which
+ *  goes on the call's `call-ended` fact; the mind's own code decides whether to send one email. */
 async function salesMessage(client: string, rawWords: unknown) {
   const words = SalesWords.parse(rawWords);
   const current = active;
@@ -442,52 +423,35 @@ async function salesMessage(client: string, rawWords: unknown) {
       llmRequestPolicy: { behaviour: "dont-trigger-request" },
     },
   });
-  const sms = await signupSmsFor(current.line).request({
-    client: current.sales.client,
-    number: current.number,
-    untrusted: current.untrustedCaller || current.test,
-    attempt: current.sales.smsAttempt,
-    isActive: () =>
-      active === current &&
-      !current.over &&
-      current.direction === "in" &&
-      isSales(current) &&
-      current.answeredAt !== null,
-    consent: () => current.sales!.smsConsent,
+  const waitingList = current.sales.waitingList;
+  const found = emailIn(words);
+  const outcome: WaitingListOutcome = !found.ok
+    ? { ok: false, status: found.status }
+    : waitingList.notes >= WAITING_LIST_CHANGES
+      ? { ok: false, status: "too-many-changes" }
+      : { ok: true, status: "noted" };
+  if (found.ok && outcome.ok)
+    current.sales.waitingList = { email: found.email, notes: waitingList.notes + 1 };
+  // the address stays off this fact: it goes on call-ended only
+  await record("waiting-list-email-outcome", {
+    callId: current.callId,
+    client,
+    line: current.line.number,
+    status: outcome.status,
   });
-  if (sms.status !== "consent-required")
-    await record("signup-sms-outcome", {
-      callId: current.callId,
-      client,
-      line: current.line.number,
-      status: sms.status,
-    });
-  if (sms.ok && active === current && !current.over && current.voice)
-    await current.voice
-      .speak(SIGNUP_CONFIRMATION)
-      .catch(() =>
-        console.error(
-          "phone-calls: signup SMS accepted but its spoken confirmation could not be queued",
-        ),
-      );
-  const guidance = sms.ok
-    ? "A&A accepted the fixed signup SMS. The bridge has supplied the exact spoken confirmation separately; do not repeat it. Stay on the call, ask them to open the link, and guide official signup in their own Cloudflare account. This does not prove handset delivery."
-    : sms.status === "consent-required"
-      ? `No SMS was sent. If useful, ask exactly: ${SIGNUP_OFFER} Wait for their clear answer, then delegate. Otherwise continue spoken signup guidance. No other action is permitted.`
-      : sms.status === "opted-out"
-        ? "Do not send or offer another text on this call. Continue spoken guidance at cloud dot iterate dot com."
-        : sms.status === "already-attempted"
-          ? "No additional SMS was sent. Do not retry or repeat the sent-link confirmation. Stay on the call and continue signup guidance."
-          : "The signup SMS could not be confirmed. Do not say it was sent or delivered, do not retry and do not ask for another number. Stay on the call and read cloud dot iterate dot com instead.";
+  const guidance = waitingListGuidance(
+    outcome,
+    current.sales.waitingList.email,
+    WAITING_LIST_CHANGES - current.sales.waitingList.notes,
+  );
   // Return the handoff's offset before its answer, so the relay can associate the two.
   setTimeout(() => {
     if (current.over || active !== current) return;
-    if (sms.status === "consent-required" && current.sales?.smsAttempt.started) return;
     void relay
       .append({
         type: "events.iterate.com/agent/web-message-sent",
         payload: {
-          message: `${JSON.stringify({ action: "send-signup-link", ...sms })}\n${guidance}`,
+          message: `${JSON.stringify({ action: "note-waiting-list-email", ...outcome })}\n${guidance}`,
           llmRequestOffset: received!.offset + 1,
         },
       })
@@ -495,7 +459,7 @@ async function salesMessage(client: string, rawWords: unknown) {
         console.error(`phone-calls: sales handoff answer failed: ${String(error)}`),
       );
   }, 50);
-  return { offset: received!.offset, signupSms: sms };
+  return { offset: received!.offset, waitingList: outcome };
 }
 /** The device of each caller this lend answers is provisioned when the lend starts, not on that
  *  caller's first call: provisioning took about 4 s, which the caller heard as ringing. */
@@ -939,26 +903,12 @@ async function connectVoice(mind: Mind, current: ActiveCall, resumed: boolean): 
           `phone-calls: the live model reported: ${fact.payload.message.slice(0, 300)}`,
         );
       if (fact.type === "events.iterate.com/voice-agent/utterance-transcribed") {
-        if (current.sales && !current.over)
-          current.sales.smsConsent = signupConsent(
-            current.sales.smsConsent,
-            "caller",
-            fact.payload.text,
-            Date.now(),
-          );
         current.said.push(`Person: ${fact.payload.text}`);
         current.personSaidBye = GOODBYE.test(fact.payload.text);
         current.spokeAt = current.personSpokeAt = Date.now();
         armGoodbye(current);
       }
       if (fact.type === "events.iterate.com/voice-agent/answer-transcribed") {
-        if (current.sales && !current.over)
-          current.sales.smsConsent = signupConsent(
-            current.sales.smsConsent,
-            "voice",
-            fact.payload.text,
-            Date.now(),
-          );
         current.said.push(`Voice: ${fact.payload.text}`);
         current.voiceSaidBye = GOODBYE.test(fact.payload.text);
         current.spokeAt = Date.now();
@@ -1083,6 +1033,12 @@ async function finished(current: ActiveCall, reason: string, answered: boolean):
     ...(current.endedAfterGoodbyes && { endedAfterGoodbyes: true }),
     seconds,
     ...(current.sales && { mode: "sales", promptCommit: current.sales.commitOid }),
+    // the mind's own code reads this and decides whether to send one waiting-list email
+    ...(current.sales &&
+      answered &&
+      current.sales.waitingList.email !== null && {
+        waitingList: { email: current.sales.waitingList.email },
+      }),
     streamPath: current.agentPath,
     activations: current.activations,
     reportTo: current.reportTo ?? null,
@@ -1514,20 +1470,16 @@ export default async function provide(connection: { itx: Mind }) {
         source: sales.map((line) => line.source),
         commitOid,
         opening: sales[0]!.opening ?? null,
-        backend: "fixed signup-link SMS after recorded opt-in; no general agent or other tools",
-        signupSms: {
-          action: "send-signup-link",
-          url: SIGNUP_URL,
-          from: "the sales line the caller rang",
-          to: "active inbound caller only",
-          consentQuestion: SIGNUP_OFFER,
-          perCall: 1,
-          perDestinationPer24Hours: 1,
-          globalPer24Hours: SIGNUP_DAILY_CAP,
-          automaticRetries: 0,
-          handsetReceiptVerified: false,
+        backend:
+          "notes one email address a call for the mind's waiting list; no general agent or other tools",
+        waitingList: {
+          action: "note-waiting-list-email",
+          changesPerCall: WAITING_LIST_CHANGES,
+          onFact: "phone-calls/call-ended payload.waitingList.email",
+          sentBy: "the mind's own code, after the call ends",
         },
-        emailFollowup: false,
+        emailFollowup:
+          "the bridge sends no email; the mind may send one waiting-list email after the call",
         maxSeconds: SALES_MAX_MS / 1000,
       };
     },
@@ -1555,7 +1507,7 @@ export default async function provide(connection: { itx: Mind }) {
       return all.map((line) => ({ number: line.number, ready: line.ready }));
     },
     __describe: () => ({
-      instructions: `${all.length > 1 ? `Phone calls on the agents' own numbers (${all.map((line, index) => `${line.number}${index ? "" : ", the default"}`).join("; ")}), over the real phone network. call({ to, from, opening, brief, reportTo }) rings a person's phone from \`from\`, one of those numbers in any spelling (the default ${defaultLine().number} unless given; lines() says which are registered):` : `Phone calls on the agents' own number${defaultLine().number ? ` (${defaultLine().number})` : ""}, over the real phone network. call({ to, opening, brief, reportTo }) rings a person's phone:`} the voice is connected first, then the phone rings (it answers { callId, ringing, streamPath } once it does; the ring gives up after ${String(RING_SECONDS)} s). When they answer they are talking to a voice agent of this mind: the person's own agent (streamPath, /agents/voice/phone-<their digits>), which keeps every call with them but not your conversation. It says \`opening\` first, and \`brief\` is all it knows about why you called, so put everything in it. A call FROM one of the same numbers is picked up the same way; to say something particular when a person next rings, leave a note first: await itx.kv.put('phone-calls/answer/<their digits>', JSON.stringify({ opening, brief, until })) (WhatsApp's whatsapp-calls/answer/<digits> note is read too). A caller's number can be faked on the phone network: the call's agent is told the caller is unverified, and a yes for money, deleting or messages to others is asked for in writing. One call at a time, WhatsApp calls included. hangup() ends it, status() answers the call in progress. Facts land on ${LOG_PATH} (phone-calls/call-placed or call-received, call-answered, call-ended with direction, the transcript and the call's metrics); with reportTo (your own agent path) you are messaged what was said when a call you placed ends. It rings only members (${Object.values(MEMBERS).join(", ") || "none"}) and ${numbers}; it answers members${ANSWER_STRANGERS ? ", and anyone else as an outside person whose message is recorded (phone-calls/stranger-message) and mailed" : ` and ${numbers}`}. Which line does what is the mind's own choice (its routeCall, call-lines.ts in the config repo): routing({ from }) answers it for each line with no call. A sales line has no general agent or member history; only one fixed signup SMS after recorded opt-in and no email; salesPolicy() describes it.`,
+      instructions: `${all.length > 1 ? `Phone calls on the agents' own numbers (${all.map((line, index) => `${line.number}${index ? "" : ", the default"}`).join("; ")}), over the real phone network. call({ to, from, opening, brief, reportTo }) rings a person's phone from \`from\`, one of those numbers in any spelling (the default ${defaultLine().number} unless given; lines() says which are registered):` : `Phone calls on the agents' own number${defaultLine().number ? ` (${defaultLine().number})` : ""}, over the real phone network. call({ to, opening, brief, reportTo }) rings a person's phone:`} the voice is connected first, then the phone rings (it answers { callId, ringing, streamPath } once it does; the ring gives up after ${String(RING_SECONDS)} s). When they answer they are talking to a voice agent of this mind: the person's own agent (streamPath, /agents/voice/phone-<their digits>), which keeps every call with them but not your conversation. It says \`opening\` first, and \`brief\` is all it knows about why you called, so put everything in it. A call FROM one of the same numbers is picked up the same way; to say something particular when a person next rings, leave a note first: await itx.kv.put('phone-calls/answer/<their digits>', JSON.stringify({ opening, brief, until })) (WhatsApp's whatsapp-calls/answer/<digits> note is read too). A caller's number can be faked on the phone network: the call's agent is told the caller is unverified, and a yes for money, deleting or messages to others is asked for in writing. One call at a time, WhatsApp calls included. hangup() ends it, status() answers the call in progress. Facts land on ${LOG_PATH} (phone-calls/call-placed or call-received, call-answered, call-ended with direction, the transcript and the call's metrics); with reportTo (your own agent path) you are messaged what was said when a call you placed ends. It rings only members (${Object.values(MEMBERS).join(", ") || "none"}) and ${numbers}; it answers members${ANSWER_STRANGERS ? ", and anyone else as an outside person whose message is recorded (phone-calls/stranger-message) and mailed" : ` and ${numbers}`}. Which line does what is the mind's own choice (its routeCall, call-lines.ts in the config repo): routing({ from }) answers it for each line with no call. A sales line has no general agent or member history; its one action notes an email address, which goes on its call-ended fact (payload.waitingList.email) for the mind's own code to send one waiting-list email; the bridge sends no SMS and no email; salesPolicy() describes it.`,
       functions: ["call", "hangup", "status", "lines", "routing", "salesPolicy"],
     }),
   };

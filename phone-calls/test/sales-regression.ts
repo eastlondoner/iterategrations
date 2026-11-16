@@ -44,7 +44,7 @@ const heard = (number: string): Record<string, any>[] => {
 try {
   const mind = pretendMind();
   let prompt =
-    "# Sales\n\n## Opening\n\n> Hello, I am the sales AI.\n\nUse https://cloud.iterate.com in your own Cloudflare account.";
+    "# Sales\n\n## Opening\n\n> Hello, I am the sales AI.\n\nAsk for an email address for the waiting list.";
   const reads: string[] = [];
   // the mind, not the bridge, says the second line is the sales line
   const routes = pretendRoutes({
@@ -164,7 +164,7 @@ try {
       (e) => e.path === relay && e.type === "events.iterate.com/agent/web-message-sent",
     ),
   );
-  assert.match(denied.payload.message, /"status":"consent-required"/);
+  assert.match(denied.payload.message, /"status":"no-address"/);
   const provisionedBeforeAttacks = mind.provisioned.length;
   const noteReadsBeforeAttacks = reads.length;
   for (const attack of [

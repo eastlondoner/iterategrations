@@ -126,6 +126,14 @@ A note for a caller's next call is kv `phone-calls/answer/<digits>` (else WhatsA
 `reason` when the call was turned away), `call-answered` and `call-ended`, the WhatsApp lend's
 payloads (`metrics.bridge` counts 20 ms frames), each with `line`: the lend's number the call is on.
 
+**A sales line** (`calls-iterate.ts`, when the mind's `routeCall` says `mode: "sales"`) has no
+general agent. Its voice can only delegate free text, which the lend treats as data. The one effect
+of that text: the lend notes one email address for the call (at most 3 changes, the last one
+stands) and puts it on the call's `call-ended` fact as `waitingList.email`. Each delegation also
+leaves a `phone-calls/waiting-list-email-outcome` fact, without the address. The lend sends no SMS
+and no email; the mind's own code reads `call-ended` and decides whether to send one waiting-list
+email. `itx.phoneCalls.salesPolicy()` describes it.
+
 One call at a time, WhatsApp's included: a call is not placed or picked up while
 `itx.whatsappCalls.status()` has one, and this lend keeps its own in kv `calls/busy`.
 
